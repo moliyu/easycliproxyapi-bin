@@ -1,0 +1,106 @@
+name: Auto Update AUR Package
+
+on:
+  schedule:
+    - cron: '0 */3 * * *' # Check every 3 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force update even if version has not changed'
+        required: false
+        type: boolean
+        default: false
+      target_version:
+        description: 'Target version without "v" (e.g. 0.3.27, leave empty for latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check latest upstream version
+        id: check_version
+        run: |
+          set -euo pipefail
+          INPUT_VER="${{ github.event.inputs.target_version }}"
+          FORCE="${{ github.event.inputs.force }}"
+
+          if [ -n "$INPUT_VER" ]; then
+            NEW_VER="${INPUT_VER#v}"
+          else
+            LATEST_TAG=$(curl -sL https://api.github.com/repos/router-for-me/EasyCLIProxyAPI/releases/latest | jq -r .tag_name)
+            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+              echo "Error: Failed to fetch latest release from GitHub API"
+              exit 1
+            fi
+            NEW_VER="${LATEST_TAG#v}"
+          fi
+
+          CURRENT_VER=$(sed -n 's/^pkgver=//p' PKGBUILD | tr -d '[:space:]')
+
+          echo "Current package version: $CURRENT_VER"
+          echo "Upstream latest version: $NEW_VER"
+
+          if [ "$FORCE" = "true" ] || [ "$NEW_VER" != "$CURRENT_VER" ]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "new_version=$NEW_VER" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already at latest version. No update needed."
+          fi
+
+      - name: Update PKGBUILD and .SRCINFO
+        if: steps.check_version.outputs.need_update == 'true'
+        env:
+          NEW_VER: ${{ steps.check_version.outputs.new_version }}
+        run: |
+          docker run --rm -e NEW_VER="$NEW_VER" -v "$PWD:/pkg" -w /pkg archlinux:base bash -c "
+            set -euo pipefail
+            pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl &&
+            useradd -m builder &&
+            chown -R builder:builder /pkg &&
+            su builder -c \"sed -i 's/^pkgver=.*/pkgver=\$NEW_VER/' /pkg/PKGBUILD\" &&
+            su builder -c \"sed -i 's/^pkgrel=.*/pkgrel=1/' /pkg/PKGBUILD\" &&
+            su builder -c 'updpkgsums' &&
+            su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO
+          "
+
+      - name: Commit and Push to GitHub and AUR
+        if: steps.check_version.outputs.need_update == 'true'
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          NEW_VER: ${{ steps.check_version.outputs.new_version }}
+        run: |
+          set -euo pipefail
+
+          # Setup SSH for AUR
+          mkdir -p ~/.ssh
+          echo "$AUR_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+
+          git config user.name "doudou"
+          git config user.email "951028382@qq.com"
+
+          git add PKGBUILD .SRCINFO easycliproxyapi.sh
+          if git diff --cached --quiet; then
+            echo "No changes staged. Skipping commit."
+            exit 0
+          fi
+
+          git commit -m "feat: bump version to ${NEW_VER}"
+
+          # Push to GitHub main branch
+          git push origin main
+
+          # Push to AUR master branch
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key" git push ssh://aur@aur.archlinux.org/easycliproxyapi-bin.git HEAD:master
