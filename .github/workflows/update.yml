@@ -63,16 +63,22 @@ jobs:
         env:
           NEW_VER: ${{ steps.check_version.outputs.new_version }}
         run: |
-          docker run --rm -e NEW_VER="$NEW_VER" -v "$PWD:/pkg" -w /pkg archlinux:base bash -c "
-            set -euo pipefail
-            pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl &&
-            useradd -m builder &&
-            chown -R builder:builder /pkg &&
-            su builder -c \"sed -i 's/^pkgver=.*/pkgver=\$NEW_VER/' /pkg/PKGBUILD\" &&
-            su builder -c \"sed -i 's/^pkgrel=.*/pkgrel=1/' /pkg/PKGBUILD\" &&
-            su builder -c 'updpkgsums' &&
-            su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO
-          "
+          docker run --rm \
+            -e NEW_VER="$NEW_VER" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -v "$PWD:/pkg" \
+            -w /pkg archlinux:base bash -c "
+              set -euo pipefail
+              pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl &&
+              useradd -m builder &&
+              chown -R builder:builder /pkg &&
+              su builder -c \"sed -i 's/^pkgver=.*/pkgver=\$NEW_VER/' /pkg/PKGBUILD\" &&
+              su builder -c \"sed -i 's/^pkgrel=.*/pkgrel=1/' /pkg/PKGBUILD\" &&
+              su builder -c 'updpkgsums' &&
+              su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO &&
+              chown -R \$HOST_UID:\$HOST_GID /pkg
+            "
 
       - name: Commit and Push to GitHub and AUR
         if: steps.check_version.outputs.need_update == 'true'
