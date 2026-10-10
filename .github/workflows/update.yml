@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
       target_version:
-        description: 'Target version without "v" (e.g. 0.3.27, leave empty for latest)'
+        description: 'Target version without "v" (e.g. 0.3.29, leave empty for latest)'
         required: false
         type: string
 
@@ -46,11 +46,13 @@ jobs:
           fi
 
           CURRENT_VER=$(sed -n 's/^pkgver=//p' PKGBUILD | tr -d '[:space:]')
+          AUR_VER=$(curl -s "https://aur.archlinux.org/rpc/v5/info/easycliproxyapi-bin" | jq -r '.results[0].Version // empty' | cut -d- -f1)
 
-          echo "Current package version: $CURRENT_VER"
+          echo "Current package version in repo: $CURRENT_VER"
+          echo "Current AUR RPC version: $AUR_VER"
           echo "Upstream latest version: $NEW_VER"
 
-          if [ "$FORCE" = "true" ] || [ "$NEW_VER" != "$CURRENT_VER" ]; then
+          if [ "$FORCE" = "true" ] || [ "$NEW_VER" != "$CURRENT_VER" ] || [ -n "$AUR_VER" -a "$NEW_VER" != "$AUR_VER" ]; then
             echo "need_update=true" >> "$GITHUB_OUTPUT"
             echo "new_version=$NEW_VER" >> "$GITHUB_OUTPUT"
           else
@@ -80,7 +82,7 @@ jobs:
               chown -R \$HOST_UID:\$HOST_GID /pkg
             "
 
-      - name: Commit and Push to GitHub and AUR
+      - name: Deploy to AUR and GitHub
         if: steps.check_version.outputs.need_update == 'true'
         env:
           AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
@@ -93,20 +95,38 @@ jobs:
           echo "$AUR_KEY" > ~/.ssh/aur_key
           chmod 600 ~/.ssh/aur_key
           ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          AUR_SSH="ssh -i ~/.ssh/aur_key -o StrictHostKeyChecking=accept-new"
 
+          # 1. Push to AUR in an isolated clean repository (strictly NO subdirectories)
+          AUR_WORK_DIR=$(mktemp -d)
+          GIT_SSH_COMMAND="$AUR_SSH" git clone ssh://aur@aur.archlinux.org/easycliproxyapi-bin.git "$AUR_WORK_DIR"
+
+          # Copy only the flat AUR package files
+          cp PKGBUILD .SRCINFO easycliproxyapi.sh easycliproxyapi.desktop "$AUR_WORK_DIR/"
+
+          cd "$AUR_WORK_DIR"
           git config user.name "doudou"
           git config user.email "951028382@qq.com"
 
-          git add PKGBUILD .SRCINFO easycliproxyapi.sh
-          if git diff --cached --quiet; then
-            echo "No changes staged. Skipping commit."
-            exit 0
+          git add PKGBUILD .SRCINFO easycliproxyapi.sh easycliproxyapi.desktop
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: bump version to ${NEW_VER}"
+            GIT_SSH_COMMAND="$AUR_SSH" git push origin master
+            echo "Successfully deployed version ${NEW_VER} to AUR."
+          else
+            echo "AUR is already up to date with version ${NEW_VER}."
           fi
 
-          git commit -m "feat: bump version to ${NEW_VER}"
+          # 2. Push to GitHub main branch
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "doudou"
+          git config user.email "951028382@qq.com"
 
-          # Push to GitHub main branch
-          git push origin main
-
-          # Push to AUR master branch
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key" git push ssh://aur@aur.archlinux.org/easycliproxyapi-bin.git HEAD:master
+          git add PKGBUILD .SRCINFO easycliproxyapi.sh easycliproxyapi.desktop
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: bump version to ${NEW_VER}"
+            git push origin main
+            echo "Successfully updated GitHub repository."
+          else
+            echo "GitHub repository is already up to date."
+          fi
