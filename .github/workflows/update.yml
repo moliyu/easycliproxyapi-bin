@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
       target_version:
-        description: 'Target version without "v" (e.g. 0.3.29, leave empty for latest)'
+        description: 'Target version without "v" (e.g. 0.3.39, leave empty for latest)'
         required: false
         type: string
 
@@ -29,6 +29,8 @@ jobs:
 
       - name: Check latest upstream version
         id: check_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           INPUT_VER="${{ github.event.inputs.target_version }}"
@@ -37,9 +39,23 @@ jobs:
           if [ -n "$INPUT_VER" ]; then
             NEW_VER="${INPUT_VER#v}"
           else
-            LATEST_TAG=$(curl -sL https://api.github.com/repos/router-for-me/EasyCLIProxyAPI/releases/latest | jq -r .tag_name)
-            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-              echo "Error: Failed to fetch latest release from GitHub API"
+            LATEST_TAG=""
+            for i in 1 2 3; do
+              RESP=$(curl -sL \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/router-for-me/EasyCLIProxyAPI/releases/latest || true)
+              TAG=$(echo "$RESP" | jq -r '.tag_name // empty')
+              if [ -n "$TAG" ] && [ "$TAG" != "null" ]; then
+                LATEST_TAG="$TAG"
+                break
+              fi
+              echo "Failed to fetch latest tag from GitHub API (attempt $i/3), retrying..."
+              sleep 2
+            done
+
+            if [ -z "$LATEST_TAG" ]; then
+              echo "Error: Failed to fetch latest release from GitHub API after 3 attempts"
               exit 1
             fi
             NEW_VER="${LATEST_TAG#v}"
@@ -72,12 +88,44 @@ jobs:
             -v "$PWD:/pkg" \
             -w /pkg archlinux:base bash -c "
               set -euo pipefail
-              pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl &&
+
+              # Configure resilient mirrors
+              cat << 'EOF' > /etc/pacman.d/mirrorlist
+Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch
+Server = https://mirror.rackspace.com/archlinux/\$repo/os/\$arch
+Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch
+Server = https://fastly.mirror.pkgbuild.com/\$repo/os/\$arch
+EOF
+              sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' /etc/pacman.conf
+
+              # Sync packages with retry
+              for i in 1 2 3; do
+                if pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl; then
+                  break
+                fi
+                if [ \"\$i\" -eq 3 ]; then
+                  echo \"Pacman installation failed after 3 attempts.\"
+                  exit 1
+                fi
+                echo \"Pacman sync failed, retrying (\$i/3)...\"
+                sleep 3
+              done
+
               useradd -m builder &&
               chown -R builder:builder /pkg &&
               su builder -c \"sed -i 's/^pkgver=.*/pkgver=\$NEW_VER/' /pkg/PKGBUILD\" &&
               su builder -c \"sed -i 's/^pkgrel=.*/pkgrel=1/' /pkg/PKGBUILD\" &&
-              su builder -c 'updpkgsums' &&
+              for i in 1 2 3; do
+                if su builder -c 'updpkgsums'; then
+                  break
+                fi
+                if [ \"\$i\" -eq 3 ]; then
+                  echo \"updpkgsums failed after 3 attempts.\"
+                  exit 1
+                fi
+                echo \"updpkgsums failed, retrying (\$i/3)...\"
+                sleep 3
+              done &&
               su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO &&
               chown -R \$HOST_UID:\$HOST_GID /pkg
             "
