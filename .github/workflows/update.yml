@@ -81,54 +81,51 @@ jobs:
         env:
           NEW_VER: ${{ steps.check_version.outputs.new_version }}
         run: |
-          docker run --rm \
+          docker run --rm -i \
             -e NEW_VER="$NEW_VER" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             -v "$PWD:/pkg" \
-            -w /pkg archlinux:base bash -c "
-              set -euo pipefail
+            -w /pkg archlinux:base bash << 'EOF'
+            set -euo pipefail
 
-              # Configure resilient mirrors
-              printf '%s\n' \
-                'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' \
-                'Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch' \
-                'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' \
-                'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' \
-                > /etc/pacman.d/mirrorlist
-              sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' /etc/pacman.conf
+            # Enable parallel downloads & backup mirrors
+            sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 5/' /etc/pacman.conf || true
+            sed -i 's|^#\(Server = https://mirror.rackspace.com.*\)|\1|' /etc/pacman.d/mirrorlist || true
+            sed -i 's|^#\(Server = https://mirrors.kernel.org.*\)|\1|' /etc/pacman.d/mirrorlist || true
 
-              # Sync packages with retry
-              for i in 1 2 3; do
-                if pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl; then
-                  break
-                fi
-                if [ \"\$i\" -eq 3 ]; then
-                  echo \"Pacman installation failed after 3 attempts.\"
-                  exit 1
-                fi
-                echo \"Pacman sync failed, retrying (\$i/3)...\"
-                sleep 3
-              done
+            for i in 1 2 3; do
+              if pacman -Syu --noconfirm --needed pacman sudo base-devel pacman-contrib curl; then
+                break
+              fi
+              if [ "$i" -eq 3 ]; then
+                echo "Pacman sync failed after 3 attempts."
+                exit 1
+              fi
+              echo "Pacman sync failed, retrying ($i/3)..."
+              sleep 3
+            done
 
-              useradd -m builder &&
-              chown -R builder:builder /pkg &&
-              su builder -c \"sed -i 's/^pkgver=.*/pkgver=\$NEW_VER/' /pkg/PKGBUILD\" &&
-              su builder -c \"sed -i 's/^pkgrel=.*/pkgrel=1/' /pkg/PKGBUILD\" &&
-              for i in 1 2 3; do
-                if su builder -c 'updpkgsums'; then
-                  break
-                fi
-                if [ \"\$i\" -eq 3 ]; then
-                  echo \"updpkgsums failed after 3 attempts.\"
-                  exit 1
-                fi
-                echo \"updpkgsums failed, retrying (\$i/3)...\"
-                sleep 3
-              done &&
-              su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO &&
-              chown -R \$HOST_UID:\$HOST_GID /pkg
-            "
+            useradd -m builder
+            chown -R builder:builder /pkg
+            su builder -c "sed -i 's/^pkgver=.*/pkgver=$NEW_VER/' /pkg/PKGBUILD"
+            su builder -c "sed -i 's/^pkgrel=.*/pkgrel=1/' /pkg/PKGBUILD"
+
+            for i in 1 2 3; do
+              if su builder -c 'updpkgsums'; then
+                break
+              fi
+              if [ "$i" -eq 3 ]; then
+                echo "updpkgsums failed after 3 attempts."
+                exit 1
+              fi
+              echo "updpkgsums failed, retrying ($i/3)..."
+              sleep 3
+            done
+
+            su builder -c 'makepkg --printsrcinfo' > /pkg/.SRCINFO
+            chown -R "$HOST_UID:$HOST_GID" /pkg
+          EOF
 
       - name: Deploy to AUR and GitHub
         if: steps.check_version.outputs.need_update == 'true'
